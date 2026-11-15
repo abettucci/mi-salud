@@ -95,7 +95,6 @@ export default function Home() {
   const [search, setSearch] = useState("")
   const [filter, setFilter] = useState<DocumentKind | "Todos">("Todos")
   const [uploadOpen, setUploadOpen] = useState(false)
-  const [textDoc, setTextDoc] = useState<HealthDocument | null>(null)
   const [analysisProgress, setAnalysisProgress] = useState<{ done: number; total: number } | null>(null)
   const analysisRunning = useRef(false)
   const [shareOpen, setShareOpen] = useState(false)
@@ -274,13 +273,6 @@ export default function Home() {
     }
     await supabase.from("health_documents").update({ ocr_text: text, analysis_error: failure || null, ocr_status: text ? "Pendiente" : "No aplica" }).eq("id", doc.id)
     setDocuments((current) => current.map((item) => item.id === doc.id ? { ...item, ocrText: text, analysisError: failure || null } : item))
-    setTextDoc((current) => current && current.id === doc.id ? { ...current, ocrText: text, analysisError: failure || null } : current)
-  }
-
-  async function extractExistingText(doc: HealthDocument) {
-    if (!supabase || !user) return showNotice("Iniciá sesión y configurá Supabase para abrir documentos privados.")
-    await analyzeDocument(doc)
-    showNotice("Lectura actualizada.")
   }
 
   async function signOut() {
@@ -315,8 +307,8 @@ export default function Home() {
 
         <div id="main-content" className="content">
           {view === "dashboard" && <Dashboard documents={documents} timeline={timeline} onUpload={() => setUploadOpen(true)} onScan={() => setUploadOpen(true)} onViewDocuments={() => setView("documents")} onViewTimeline={() => setView("timeline")} onAddEvent={() => setEventOpen(true)} />}
-          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => setTextDoc(doc)} />}
-          {view === "analysis" && <AnalysisView documents={documents} progress={analysisProgress} onReview={(doc) => setTextDoc(doc)} />}
+          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => void previewDocument(doc)} />}
+          {view === "analysis" && <AnalysisView documents={documents} progress={analysisProgress} onReview={(doc) => void previewDocument(doc)} onRetry={(doc) => void analyzeDocument(doc)} />}
           {view === "timeline" && <Timeline timeline={timeline} onAddEvent={() => setEventOpen(true)} />}
           {view === "share" && <Sharing sharing={sharing} setSharing={setSharing} onAdd={() => setShareOpen(true)} onNotice={showNotice} />}
           {view === "privacy" && <Privacy consent={consent} setConsent={setConsent} onNotice={showNotice} />}
@@ -328,7 +320,6 @@ export default function Home() {
       </section>
 
       {uploadOpen && <UploadModal onClose={() => setUploadOpen(false)} onAdd={addDocument} />}
-      {textDoc && <TextModal doc={textDoc} onClose={() => setTextDoc(null)} onOpen={() => void previewDocument(textDoc)} onExtract={() => void extractExistingText(textDoc)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} onSubmit={addShare} />}
       {eventOpen && <EventModal onClose={() => setEventOpen(false)} onSubmit={addEvent} />}
       {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onNotice={showNotice} />}
@@ -357,11 +348,7 @@ function mimeFromPath(path: string) {
   return null
 }
 
-function TextModal({ doc, onClose, onOpen, onExtract }: { doc: HealthDocument; onClose: () => void; onOpen: () => void; onExtract: () => void }) {
-  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="text-title"><button className="modal-close" onClick={onClose} aria-label="Cerrar"><X /></button><span className="modal-kicker"><FileText />Texto detectado</span><h2 id="text-title">{doc.name}</h2><p>Se extrajo en tu navegador; no se envió a ningún servicio. Revisalo antes de usarlo.</p>{doc.analysisError && <p style={{ color: "#b5452c" }}>{doc.analysisError}</p>}<pre style={{ whiteSpace: "pre-wrap", maxHeight: "50vh", overflow: "auto", fontSize: "0.9rem" }}>{doc.ocrText || "No se detectó texto en este archivo."}</pre>{!doc.ocrText && <button className="button full" onClick={onExtract}>Reintentar lectura</button>}<button className="button primary full" onClick={onOpen}>Abrir original<ArrowRight /></button></section></div>
-}
-
-function AnalysisView({ documents, progress, onReview }: { documents: HealthDocument[]; progress: { done: number; total: number } | null; onReview: (doc: HealthDocument) => void }) {
+function AnalysisView({ documents, progress, onReview, onRetry }: { documents: HealthDocument[]; progress: { done: number; total: number } | null; onReview: (doc: HealthDocument) => void; onRetry: (doc: HealthDocument) => void }) {
   const rows = documents.map((doc) => ({ doc, header: doc.ocrText ? extractHeader(doc.ocrText) : null }))
   const read = rows.filter((row) => row.doc.ocrText)
   const failed = rows.filter((row) => row.doc.analysisError)
@@ -384,9 +371,9 @@ function AnalysisView({ documents, progress, onReview }: { documents: HealthDocu
       <div style={card}><strong>{centers.size}</strong><p>Centros distintos</p></div>
       <div style={card}><strong>{failed.length}</strong><p>Con error</p></div>
     </div>
-    {failed.length > 0 && <section style={{ ...card, marginBottom: "1.5rem" }}><h2>Para revisar</h2><ul>{failed.map(({ doc }) => <li key={String(doc.id)}><strong>{doc.name}</strong>: {doc.analysisError} <button className="button" onClick={() => onReview(doc)}>Ver</button></li>)}</ul></section>}
+    {failed.length > 0 && <section style={{ ...card, marginBottom: "1.5rem" }}><h2>Para revisar</h2><ul>{failed.map(({ doc }) => <li key={String(doc.id)}><strong>{doc.name}</strong>: {doc.analysisError} <button className="button" onClick={() => onReview(doc)}>Ver original</button> <button className="button" onClick={() => onRetry(doc)}>Reintentar</button></li>)}</ul></section>}
     <section style={{ ...card, marginBottom: "1.5rem" }}><h2>Centros</h2>{centers.size === 0 ? <p>Todavía no hay centros detectados.</p> : <ul>{[...centers].map(([name, count]) => <li key={name}>{name}: {count} estudio(s)</li>)}</ul>}</section>
-    <section style={{ overflowX: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9rem" }}><thead><tr><th align="left">Fecha</th><th align="left">Documento</th><th align="left">Tipo</th><th align="left">Centro</th><th align="left">Médico</th><th align="left">Estado</th></tr></thead><tbody>{rows.map(({ doc, header }) => <tr key={String(doc.id)} style={{ borderTop: "1px solid #e5dfd2" }}><td>{formatDate(doc.date, true)}</td><td>{doc.name}</td><td>{doc.kind}</td><td>{header?.institution ?? "—"}</td><td>{header?.doctor ?? "—"}</td><td>{doc.analysisError ? <span style={{ color: "#b5452c" }}>Error</span> : doc.ocrText ? "Leído" : "Pendiente"}</td></tr>)}</tbody></table></section>
+    <section style={{ overflowX: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.9rem" }}><thead><tr><th align="left">Fecha del estudio</th><th align="left">Documento</th><th align="left">Tipo</th><th align="left">Centro</th><th align="left">Médico</th><th align="left">Estado</th></tr></thead><tbody>{rows.map(({ doc, header }) => <tr key={String(doc.id)} style={{ borderTop: "1px solid #e5dfd2" }}><td>{header?.orderDate ?? doc.name.match(/\d{2}[-/.]\d{2}[-/.]\d{4}/)?.[0].replace(/[-.]/g, "/") ?? "—"}</td><td>{doc.name}</td><td>{doc.kind}</td><td>{header?.institution ?? "—"}</td><td>{header?.doctor ?? "—"}</td><td>{doc.analysisError ? <span style={{ color: "#b5452c" }}>Error</span> : doc.ocrText ? "Leído" : "Pendiente"}</td></tr>)}</tbody></table></section>
     <p style={{ marginTop: "1.5rem", fontSize: "0.9rem" }}>Valores de laboratorio, rangos de referencia y tendencias: todavía no se analizan. Eso requiere definir un método de lectura de resultados.</p>
   </>
 }
