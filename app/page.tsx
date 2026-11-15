@@ -3,6 +3,7 @@
 import { ChangeEvent, useEffect, useMemo, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import { getSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase"
+import { extractText } from "@/lib/ocr"
 import {
   Activity, Archive, ArrowRight, Bell, CalendarDays, Camera, Check, ChevronDown,
   ChevronRight, CircleHelp, Download, FileImage, FilePlus2, FileText,
@@ -25,6 +26,7 @@ type HealthDocument = {
   size: string
   tone: "blue" | "sage" | "terracotta" | "ink"
   assetPath?: string
+  ocrText?: string
 }
 
 type TimelineEvent = {
@@ -90,6 +92,7 @@ export default function Home() {
   const [search, setSearch] = useState("")
   const [filter, setFilter] = useState<DocumentKind | "Todos">("Todos")
   const [uploadOpen, setUploadOpen] = useState(false)
+  const [textDoc, setTextDoc] = useState<HealthDocument | null>(null)
   const [shareOpen, setShareOpen] = useState(false)
   const [eventOpen, setEventOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
@@ -134,7 +137,7 @@ export default function Home() {
     if (!supabase) return
     setSyncing(true)
     const [documentResult, eventResult] = await Promise.all([
-      supabase.from("health_documents").select("id, display_name, document_type, issued_at, issuer, tags, ocr_status, byte_size, asset_path").eq("owner_id", ownerId).order("issued_at", { ascending: false }),
+      supabase.from("health_documents").select("id, display_name, document_type, issued_at, issuer, tags, ocr_status, ocr_text, byte_size, asset_path").eq("owner_id", ownerId).order("issued_at", { ascending: false }),
       supabase.from("timeline_events").select("id, occurred_at, title, detail, event_kind").eq("owner_id", ownerId).order("occurred_at", { ascending: false }),
     ])
     if (documentResult.error || eventResult.error) {
@@ -143,7 +146,7 @@ export default function Home() {
       setDocuments((documentResult.data ?? []).map((doc) => ({
         id: doc.id, name: doc.display_name, kind: doc.document_type as DocumentKind, date: doc.issued_at,
         issuer: doc.issuer, tags: doc.tags ?? [], ocr: doc.ocr_status as HealthDocument["ocr"],
-        size: `${Math.max(1, Math.round(Number(doc.byte_size) / 1024))} KB`, tone: toneForKind(doc.document_type as DocumentKind), assetPath: doc.asset_path,
+        size: `${Math.max(1, Math.round(Number(doc.byte_size) / 1024))} KB`, tone: toneForKind(doc.document_type as DocumentKind), assetPath: doc.asset_path, ocrText: doc.ocr_text ?? "",
       })))
       setTimeline((eventResult.data ?? []).map((event) => ({
         id: event.id, date: event.occurred_at, title: event.title, detail: event.detail,
@@ -162,6 +165,7 @@ export default function Home() {
     const date = new Date().toISOString().slice(0, 10)
     if (supabase && user) {
       setSyncing(true)
+      const ocrText = await extractText(file).catch(() => "")
       const cleanName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_")
       const assetPath = `${user.id}/${crypto.randomUUID()}-${cleanName}`
       const { error: uploadError } = await supabase.storage.from("health-documents").upload(assetPath, file, { contentType: file.type, upsert: false })
@@ -169,7 +173,7 @@ export default function Home() {
       const { data: created, error: documentError } = await supabase.from("health_documents").insert({
         owner_id: user.id, display_name: file.name.replace(/\.[^/.]+$/, "") || "Documento sin título", document_type: kind,
         issued_at: date, issuer: "Pendiente de completar", tags: scanned ? ["Escaneado"] : ["Nuevo"],
-        ocr_status: file.type === "application/pdf" ? "No aplica" : "Pendiente", asset_path: assetPath, mime_type: file.type, byte_size: file.size,
+        ocr_status: ocrText ? "Pendiente" : "No aplica", ocr_text: ocrText, asset_path: assetPath, mime_type: file.type, byte_size: file.size,
       }).select("id").single()
       if (documentError || !created) { await supabase.storage.from("health-documents").remove([assetPath]); setSyncing(false); return showNotice("No se pudo guardar el documento. El archivo fue descartado.") }
       await supabase.from("timeline_events").insert({ owner_id: user.id, document_id: created.id, occurred_at: date, event_kind: kind, title: file.name.replace(/\.[^/.]+$/, "") || "Documento sin título", detail: `${scanned ? "Documento escaneado" : "Documento cargado"} · Texto pendiente de revisión` })
@@ -220,6 +224,21 @@ export default function Home() {
     window.open(data.signedUrl, "_blank", "noopener,noreferrer")
   }
 
+  async function extractExistingText(doc: HealthDocument) {
+    if (!doc.assetPath || !supabase || !user) return showNotice("Iniciá sesión y configurá Supabase para abrir documentos privados.")
+    const type = mimeFromPath(doc.assetPath)
+    if (!type) return showNotice("Este formato no se puede leer.")
+    const { data, error } = await supabase.storage.from("health-documents").download(doc.assetPath)
+    if (error || !data) return showNotice("No se pudo descargar el documento.")
+    const text = await extractText(new File([data], doc.name, { type })).catch(() => "")
+    const status = text ? "Pendiente" : "No aplica"
+    const { error: updateError } = await supabase.from("health_documents").update({ ocr_text: text, ocr_status: status }).eq("id", doc.id)
+    if (updateError) return showNotice("No se pudo guardar el texto extraído.")
+    setDocuments((current) => current.map((item) => item.id === doc.id ? { ...item, ocrText: text, ocr: status } : item))
+    setTextDoc((current) => current && current.id === doc.id ? { ...current, ocrText: text, ocr: status } : current)
+    showNotice(text ? "Texto extraído. Revisalo antes de usarlo." : "No se encontró texto en este archivo.")
+  }
+
   async function signOut() {
     if (!supabase) return
     await supabase.auth.signOut()
@@ -252,7 +271,7 @@ export default function Home() {
 
         <div id="main-content" className="content">
           {view === "dashboard" && <Dashboard documents={documents} timeline={timeline} onUpload={() => setUploadOpen(true)} onScan={() => setUploadOpen(true)} onViewDocuments={() => setView("documents")} onViewTimeline={() => setView("timeline")} onAddEvent={() => setEventOpen(true)} />}
-          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => void previewDocument(doc)} />}
+          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => setTextDoc(doc)} />}
           {view === "timeline" && <Timeline timeline={timeline} onAddEvent={() => setEventOpen(true)} />}
           {view === "share" && <Sharing sharing={sharing} setSharing={setSharing} onAdd={() => setShareOpen(true)} onNotice={showNotice} />}
           {view === "privacy" && <Privacy consent={consent} setConsent={setConsent} onNotice={showNotice} />}
@@ -264,6 +283,7 @@ export default function Home() {
       </section>
 
       {uploadOpen && <UploadModal onClose={() => setUploadOpen(false)} onAdd={addDocument} />}
+      {textDoc && <TextModal doc={textDoc} onClose={() => setTextDoc(null)} onOpen={() => void previewDocument(textDoc)} onExtract={() => void extractExistingText(textDoc)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} onSubmit={addShare} />}
       {eventOpen && <EventModal onClose={() => setEventOpen(false)} onSubmit={addEvent} />}
       {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onNotice={showNotice} />}
@@ -282,6 +302,18 @@ function Dashboard({ documents, timeline, onUpload, onScan, onViewDocuments, onV
       <div className="panel documents-panel enter" style={{ animationDelay: "220ms" }}><div className="panel-heading"><div><p className="eyebrow">Tu información</p><h2>Documentos recientes</h2></div><button className="small-link" onClick={onViewDocuments}>Ver todos</button></div><div className="document-list">{recent.map((doc) => <DocumentRow key={doc.id} doc={doc} />)}</div><button className="drop-zone" onClick={onUpload}><Upload /><span>Soltá un archivo o <b>elegilo desde tu dispositivo</b></span><small>PDF, JPG, PNG o HEIC · Máximo 15 MB</small></button></div></section>
     <section className="disclaimer"><CircleHelp /><p><strong>Un espacio para organizarte.</strong> Mi Salud no reemplaza la historia clínica de una institución ni el consejo de profesionales de salud.</p></section>
   </>
+}
+
+function mimeFromPath(path: string) {
+  const ext = path.split(".").pop()?.toLowerCase()
+  if (ext === "pdf") return "application/pdf"
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg"
+  if (ext === "png") return "image/png"
+  return null
+}
+
+function TextModal({ doc, onClose, onOpen, onExtract }: { doc: HealthDocument; onClose: () => void; onOpen: () => void; onExtract: () => void }) {
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="text-title"><button className="modal-close" onClick={onClose} aria-label="Cerrar"><X /></button><span className="modal-kicker"><FileText />Texto detectado</span><h2 id="text-title">{doc.name}</h2><p>Se extrajo en tu navegador; no se envió a ningún servicio. Revisalo antes de usarlo.</p><pre style={{ whiteSpace: "pre-wrap", maxHeight: "50vh", overflow: "auto", fontSize: "0.9rem" }}>{doc.ocrText || "No se detectó texto en este archivo."}</pre>{!doc.ocrText && <button className="button full" onClick={onExtract}>Extraer texto</button>}<button className="button primary full" onClick={onOpen}>Abrir original<ArrowRight /></button></section></div>
 }
 
 function Documents({ documents, filter, setFilter, onUpload, onSelect }: { documents: HealthDocument[]; filter: DocumentKind | "Todos"; setFilter: (kind: DocumentKind | "Todos") => void; onUpload: () => void; onSelect: (document: HealthDocument) => void }) {
