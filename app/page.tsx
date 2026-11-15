@@ -4,6 +4,7 @@ import { ChangeEvent, useEffect, useMemo, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import { getSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase"
 import { extractText } from "@/lib/ocr"
+import { parseLabText, type ParsedLab } from "@/lib/labs"
 import {
   Activity, Archive, ArrowRight, Bell, CalendarDays, Camera, Check, ChevronDown,
   ChevronRight, CircleHelp, Download, FileImage, FilePlus2, FileText,
@@ -93,6 +94,7 @@ export default function Home() {
   const [filter, setFilter] = useState<DocumentKind | "Todos">("Todos")
   const [uploadOpen, setUploadOpen] = useState(false)
   const [textDoc, setTextDoc] = useState<HealthDocument | null>(null)
+  const [textLabs, setTextLabs] = useState<{ analyte: string; value: number; unit: string; ref_text: string; flag: string }[]>([])
   const [shareOpen, setShareOpen] = useState(false)
   const [eventOpen, setEventOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
@@ -176,6 +178,7 @@ export default function Home() {
         ocr_status: ocrText ? "Pendiente" : "No aplica", ocr_text: ocrText, asset_path: assetPath, mime_type: file.type, byte_size: file.size,
       }).select("id").single()
       if (documentError || !created) { await supabase.storage.from("health-documents").remove([assetPath]); setSyncing(false); return showNotice("No se pudo guardar el documento. El archivo fue descartado.") }
+      if (ocrText) await saveLabResults(created.id, user.id, parseLabText(ocrText), date)
       await supabase.from("timeline_events").insert({ owner_id: user.id, document_id: created.id, occurred_at: date, event_kind: kind, title: file.name.replace(/\.[^/.]+$/, "") || "Documento sin título", detail: `${scanned ? "Documento escaneado" : "Documento cargado"} · Texto pendiente de revisión` })
       await loadHealthData(user.id)
       setSyncing(false)
@@ -224,8 +227,32 @@ export default function Home() {
     window.open(data.signedUrl, "_blank", "noopener,noreferrer")
   }
 
+  async function saveLabResults(documentId: string | number, ownerId: string, parsed: ParsedLab, fallbackDate: string) {
+    if (!supabase) return
+    await supabase.from("lab_results").delete().eq("document_id", documentId)
+    const rows = parsed.results.filter((r) => Number.isFinite(r.value)).map((r) => ({
+      owner_id: ownerId, document_id: documentId, collected_on: parsed.collectedOn ?? fallbackDate,
+      analyte: r.analyte, value: r.value, unit: r.unit,
+      ref_low: Number.isFinite(r.refLow) ? r.refLow : null, ref_high: Number.isFinite(r.refHigh) ? r.refHigh : null,
+      ref_text: r.refText, flag: r.flag, raw_line: r.rawLine,
+    }))
+    if (rows.length) await supabase.from("lab_results").insert(rows)
+  }
+
+  async function loadLabs(documentId: string | number) {
+    if (!supabase) return
+    const { data } = await supabase.from("lab_results").select("analyte, value, unit, ref_text, flag").eq("document_id", documentId).order("analyte")
+    setTextLabs(data ?? [])
+  }
+
   async function extractExistingText(doc: HealthDocument) {
-    if (!doc.assetPath || !supabase || !user) return showNotice("Iniciá sesión y configurá Supabase para abrir documentos privados.")
+    if (!supabase || !user) return showNotice("Iniciá sesión y configurá Supabase para abrir documentos privados.")
+    if (doc.ocrText) {
+      await saveLabResults(doc.id, user.id, parseLabText(doc.ocrText), doc.date)
+      await loadLabs(doc.id)
+      return showNotice("Análisis actualizado.")
+    }
+    if (!doc.assetPath) return showNotice("Iniciá sesión y configurá Supabase para abrir documentos privados.")
     const type = mimeFromPath(doc.assetPath)
     if (!type) return showNotice("Este formato no se puede leer.")
     const { data, error } = await supabase.storage.from("health-documents").download(doc.assetPath)
@@ -234,6 +261,8 @@ export default function Home() {
     const status = text ? "Pendiente" : "No aplica"
     const { error: updateError } = await supabase.from("health_documents").update({ ocr_text: text, ocr_status: status }).eq("id", doc.id)
     if (updateError) return showNotice("No se pudo guardar el texto extraído.")
+    await saveLabResults(doc.id, user.id, parseLabText(text), doc.date)
+    await loadLabs(doc.id)
     setDocuments((current) => current.map((item) => item.id === doc.id ? { ...item, ocrText: text, ocr: status } : item))
     setTextDoc((current) => current && current.id === doc.id ? { ...current, ocrText: text, ocr: status } : current)
     showNotice(text ? "Texto extraído. Revisalo antes de usarlo." : "No se encontró texto en este archivo.")
@@ -271,7 +300,7 @@ export default function Home() {
 
         <div id="main-content" className="content">
           {view === "dashboard" && <Dashboard documents={documents} timeline={timeline} onUpload={() => setUploadOpen(true)} onScan={() => setUploadOpen(true)} onViewDocuments={() => setView("documents")} onViewTimeline={() => setView("timeline")} onAddEvent={() => setEventOpen(true)} />}
-          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => setTextDoc(doc)} />}
+          {view === "documents" && <Documents documents={filteredDocuments} filter={filter} setFilter={setFilter} onUpload={() => setUploadOpen(true)} onSelect={(doc) => { setTextDoc(doc); void loadLabs(doc.id) }} />}
           {view === "timeline" && <Timeline timeline={timeline} onAddEvent={() => setEventOpen(true)} />}
           {view === "share" && <Sharing sharing={sharing} setSharing={setSharing} onAdd={() => setShareOpen(true)} onNotice={showNotice} />}
           {view === "privacy" && <Privacy consent={consent} setConsent={setConsent} onNotice={showNotice} />}
@@ -283,7 +312,7 @@ export default function Home() {
       </section>
 
       {uploadOpen && <UploadModal onClose={() => setUploadOpen(false)} onAdd={addDocument} />}
-      {textDoc && <TextModal doc={textDoc} onClose={() => setTextDoc(null)} onOpen={() => void previewDocument(textDoc)} onExtract={() => void extractExistingText(textDoc)} />}
+      {textDoc && <TextModal doc={textDoc} labs={textLabs} onClose={() => setTextDoc(null)} onOpen={() => void previewDocument(textDoc)} onExtract={() => void extractExistingText(textDoc)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} onSubmit={addShare} />}
       {eventOpen && <EventModal onClose={() => setEventOpen(false)} onSubmit={addEvent} />}
       {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onNotice={showNotice} />}
@@ -312,8 +341,8 @@ function mimeFromPath(path: string) {
   return null
 }
 
-function TextModal({ doc, onClose, onOpen, onExtract }: { doc: HealthDocument; onClose: () => void; onOpen: () => void; onExtract: () => void }) {
-  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="text-title"><button className="modal-close" onClick={onClose} aria-label="Cerrar"><X /></button><span className="modal-kicker"><FileText />Texto detectado</span><h2 id="text-title">{doc.name}</h2><p>Se extrajo en tu navegador; no se envió a ningún servicio. Revisalo antes de usarlo.</p><pre style={{ whiteSpace: "pre-wrap", maxHeight: "50vh", overflow: "auto", fontSize: "0.9rem" }}>{doc.ocrText || "No se detectó texto en este archivo."}</pre>{!doc.ocrText && <button className="button full" onClick={onExtract}>Extraer texto</button>}<button className="button primary full" onClick={onOpen}>Abrir original<ArrowRight /></button></section></div>
+function TextModal({ doc, labs, onClose, onOpen, onExtract }: { doc: HealthDocument; labs: { analyte: string; value: number; unit: string; ref_text: string; flag: string }[]; onClose: () => void; onOpen: () => void; onExtract: () => void }) {
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="text-title"><button className="modal-close" onClick={onClose} aria-label="Cerrar"><X /></button><span className="modal-kicker"><FileText />Texto detectado</span><h2 id="text-title">{doc.name}</h2><p>Se extrajo en tu navegador; no se envió a ningún servicio. Revisalo antes de usarlo.</p>{labs.length > 0 && <div style={{ overflow: "auto", maxHeight: "30vh", marginBottom: "1rem" }}><table style={{ width: "100%", fontSize: "0.85rem", borderCollapse: "collapse" }}><thead><tr><th align="left">Análisis</th><th align="right">Valor</th><th align="left">Referencia</th><th align="left">Estado</th></tr></thead><tbody>{labs.map((lab, i) => <tr key={i}><td>{lab.analyte}</td><td align="right">{lab.value} {lab.unit}</td><td>{lab.ref_text || "—"}</td><td style={lab.flag === "Normal" ? undefined : { color: "#b5452c", fontWeight: 600 }}>{lab.flag}</td></tr>)}</tbody></table></div>}<pre style={{ whiteSpace: "pre-wrap", maxHeight: "50vh", overflow: "auto", fontSize: "0.9rem" }}>{doc.ocrText || "No se detectó texto en este archivo."}</pre><button className="button full" onClick={onExtract}>{doc.ocrText ? "Analizar de nuevo" : "Extraer texto"}</button><button className="button primary full" onClick={onOpen}>Abrir original<ArrowRight /></button></section></div>
 }
 
 function Documents({ documents, filter, setFilter, onUpload, onSelect }: { documents: HealthDocument[]; filter: DocumentKind | "Todos"; setFilter: (kind: DocumentKind | "Todos") => void; onUpload: () => void; onSelect: (document: HealthDocument) => void }) {
